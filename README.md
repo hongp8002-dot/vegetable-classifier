@@ -1,126 +1,324 @@
-# 🥕 Hệ thống Phân loại Rau Củ Quả (Vegetable & Fruit Classification)
+# 🥕 Vegetable & Fruit Image Classification
 
-Đồ án học phần **Học máy** — phân loại ảnh rau/củ/quả bằng Deep Learning (CNN & Transfer Learning), có pipeline ML đầy đủ từ EDA đến demo application.
+Đồ án môn **Machine Learning** — xây dựng pipeline phân loại rau củ quả từ ảnh với 3 phương pháp khác nhau để so sánh.
 
-## Tổng quan
+**Dataset**: [Fruit and Vegetable Image Recognition](https://www.kaggle.com/datasets/kritikseth/fruit-and-vegetable-image-recognition) — 36 class, ~3.600 ảnh.
 
 ```
-Dataset (Kaggle) → EDA → Preprocessing → Augmentation → Training
-    → Evaluation → So sánh model → Chọn Final Model → Inference → Streamlit Demo
+Ảnh đầu vào → Tiền xử lý → Model → Dự đoán → Confidence Score → Kết quả
 ```
 
-- **Dataset:** [Fruit and Vegetable Image Recognition](https://www.kaggle.com/datasets/kritikseth/fruit-and-vegetable-image-recognition) (Kaggle, ~36 class rau/củ/quả)
-- **Framework:** TensorFlow / Keras
-- **Model 1 — Baseline:** CNN tự xây (3 khối Conv2D-BN-MaxPool)
-- **Model 2 — Transfer Learning:** MobileNetV2 (pretrained ImageNet)
-- **Demo:** Streamlit web app
+---
 
-Xem lý do lựa chọn công nghệ chi tiết trong phần [Quyết định kỹ thuật](#quyết-định-kỹ-thuật) bên dưới.
+## Mục lục
+
+1. [3 Model được so sánh](#3-model-được-so-sánh)
+2. [Cấu trúc project](#cấu-trúc-project)
+3. [Cài đặt](#cài-đặt)
+4. [Dataset](#dataset)
+5. [Chạy từ đầu (Quickstart)](#chạy-từ-đầu-quickstart)
+6. [EDA — Phân tích dữ liệu](#eda--phân-tích-dữ-liệu)
+7. [Huấn luyện model](#huấn-luyện-model)
+8. [Đánh giá & So sánh](#đánh-giá--so-sánh)
+9. [Inference](#inference)
+10. [Demo Streamlit](#demo-streamlit)
+11. [Kết quả](#kết-quả)
+12. [Hạn chế & Hướng phát triển](#hạn-chế--hướng-phát-triển)
+
+---
+
+## 3 Model được so sánh
+
+| Model | Phương pháp | File |
+|-------|------------|------|
+| **Classical SVM** | HOG + Color Histogram → PCA → SVM (RBF kernel + GridSearchCV) | `src/models/classical_svm.py` |
+| **Baseline CNN** | CNN từ đầu: 3×(Conv+ReLU+MaxPool) → Dense → Softmax | `src/models/baseline_cnn.py` |
+| **MobileNetV2** | Transfer learning từ ImageNet, fine-tune lớp cuối | `src/models/transfer_model.py` |
+
+**Mục tiêu**: So sánh phương pháp ML cổ điển (SVM) với Deep Learning (CNN) và Transfer Learning (MobileNetV2) để rút ra kết luận có cơ sở thực nghiệm.
+
+---
 
 ## Cấu trúc project
 
 ```
 vegetable-classifier/
-├── configs/config.py          # TOÀN BỘ hyperparameter & đường dẫn — sửa ở đây, không hard-code nơi khác
-├── data/raw/                  # Dataset (không commit — tải về theo hướng dẫn bên dưới)
-├── notebooks/EDA.ipynb        # Exploratory Data Analysis
+├── configs/
+│   └── config.py               # Tất cả hyperparameter & đường dẫn (nguồn duy nhất)
+│
 ├── src/
-│   ├── data/                  # dataset.py (loader + class_weight), augmentation.py, eda.py
-│   ├── models/                # baseline_cnn.py, transfer_model.py
-│   ├── training/train.py      # Training pipeline (cả 2 model)
-│   ├── evaluation/            # metrics.py, confusion_matrix.py, error_analysis.py,
-│   │                          # plot_history.py (training curves), report.py, evaluate.py
-│   ├── inference/predict.py   # Pipeline dự đoán 1 ảnh (dùng chung cho CLI & Streamlit)
-│   └── utils/logger.py
-├── app/streamlit_app.py       # Demo application (3 tab: Dự đoán / Model / Đánh giá)
-├── scripts/download_dataset.py
-├── tests/                     # Unit test (chạy độc lập với dataset thật, dùng dữ liệu giả lập)
-├── checkpoints/                # Model đã train (.keras) — sinh ra sau khi train
-├── reports/                    # Metrics, confusion matrix, biểu đồ, so sánh model
+│   ├── features/               # Rút trích đặc trưng (cho SVM)
+│   │   ├── __init__.py
+│   │   ├── hog_features.py     # HOG + Color Histogram
+│   │   └── pca_wrapper.py      # Giảm chiều với PCA
+│   ├── models/
+│   │   ├── baseline_cnn.py     # CNN đơn giản
+│   │   ├── transfer_model.py   # MobileNetV2 transfer learning
+│   │   └── classical_svm.py    # SVM với GridSearchCV
+│   ├── data/
+│   │   ├── dataset.py          # Load train/val/test splits
+│   │   ├── augmentation.py     # Data augmentation (cho CNN/MobileNetV2)
+│   │   └── eda.py              # Phân tích & trực quan hóa dataset
+│   ├── training/
+│   │   ├── train.py            # Training CNN / MobileNetV2
+│   │   └── tune.py             # Hyperparameter grid search
+│   ├── evaluation/
+│   │   ├── evaluate.py         # Metrics: Accuracy, F1, Confusion Matrix
+│   │   ├── compare_models.py   # So sánh 3 model, sinh bảng kết quả
+│   │   ├── plot_history.py     # Vẽ training/validation curves
+│   │   ├── confusion_matrix.py
+│   │   ├── error_analysis.py
+│   │   └── report.py
+│   └── inference/
+│       └── predict.py          # Inference dùng chung cho cả 3 model
+│
+├── app/
+│   └── streamlit_app.py        # Demo UI — upload ảnh, chọn model, xem kết quả
+│
+├── notebooks/
+│   └── EDA.ipynb               # Phân tích dữ liệu tương tác
+│
+├── scripts/
+│   ├── download_dataset.py     # Tải dataset từ Kaggle API
+│   └── make_synthetic_dataset.py  # Tạo dataset giả để test
+│
+├── checkpoints/                # Model đã train (*.keras, *.pkl)
+├── reports/                    # Kết quả đánh giá, biểu đồ, báo cáo
+├── tests/                      # Pytest test suite
+│
 ├── requirements.txt
-└── TRAINING_GUIDE.md          # Hướng dẫn train chi tiết từng bước
+├── .gitignore
+├── TRAINING_GUIDE.md
+├── ACADEMIC_PRESENTATION.md
+└── README.md
 ```
 
-## Cài đặt nhanh
+---
+
+## Cài đặt
+
+Yêu cầu **Python 3.10+**.
 
 ```bash
-# 1. Tạo virtual environment
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-
-# 2. Cài dependencies
+git clone https://github.com/YOUR_USERNAME/vegetable-classifier.git
+cd vegetable-classifier
 pip install -r requirements.txt
+```
 
-# 3. Tải dataset (xem chi tiết trong TRAINING_GUIDE.md)
-python scripts/download_dataset.py
+> Nếu môi trường báo lỗi "externally managed": dùng virtualenv:
+> ```bash
+> python -m venv .venv
+> .venv\Scripts\activate      # Windows
+> source .venv/bin/activate   # Mac/Linux
+> pip install -r requirements.txt
+> ```
 
-# 4. Chạy EDA
-jupyter notebook notebooks/EDA.ipynb
+---
 
-# 5. Train model
-python -m src.training.train --model both
+## Dataset
 
-# 6. Đánh giá & so sánh 2 model (sinh luôn reports/evaluation_report.md)
-python -m src.evaluation.evaluate --compare
+**Nguồn**: [Kaggle — Fruit and Vegetable Image Recognition](https://www.kaggle.com/datasets/kritikseth/fruit-and-vegetable-image-recognition)
 
-# 7. Chạy demo
+- 36 class (rau củ quả): apple, banana, carrot, tomato, ...
+- ~100 ảnh/class cho tập train; có sẵn validation và test riêng
+- Cấu trúc: `train/<class>/`, `validation/<class>/`, `test/<class>/`
+
+**Tải dataset**:
+
+```bash
+# 1. Lấy API token tại https://www.kaggle.com/settings → "Create New API Token"
+#    Đặt file kaggle.json vào ~/.kaggle/
+# 2. Chạy:
+python scripts/download_dataset.py --output-dir data/raw
+```
+
+Dataset sẽ được giải nén vào `data/raw/`.
+
+---
+
+## Chạy từ đầu (Quickstart)
+
+### Model SVM (HOG + PCA + SVM)
+
+```bash
+# Rút trích đặc trưng → train SVM (chạy trên CPU, không cần GPU)
+python -m src.models.classical_svm --data-dir data/raw
+```
+
+Kết quả lưu tại:
+- `checkpoints/svm_model.pkl` — SVM model
+- `checkpoints/pca_model.pkl` — PCA model
+- `reports/svm_evaluation.json` — metrics
+
+### Model CNN Baseline
+
+```bash
+python -m src.training.train --model baseline --data-dir data/raw --epochs 30
+python -m src.evaluation.evaluate --checkpoint checkpoints/baseline_cnn_best.keras --data-dir data/raw
+```
+
+### Model MobileNetV2
+
+```bash
+python -m src.training.train --model transfer --data-dir data/raw --epochs 30
+python -m src.evaluation.evaluate --checkpoint checkpoints/mobilenetv2_transfer_best.keras --data-dir data/raw
+```
+
+### So sánh 3 model
+
+```bash
+python -m src.evaluation.compare_models \
+    --checkpoints checkpoints/svm_model.pkl checkpoints/baseline_cnn_best.keras checkpoints/mobilenetv2_transfer_best.keras \
+    --data-dir data/raw
+```
+
+### Demo Streamlit
+
+```bash
 streamlit run app/streamlit_app.py
 ```
 
-## Tính năng chính
+---
 
-**Pipeline ML**
-
-- EDA đầy đủ: class distribution, ảnh mẫu, phân bố kích thước, phát hiện ảnh lỗi & class imbalance
-- Preprocessing tách bạch train/val/test — augmentation CHỈ áp dụng cho train (không data leakage)
-- Tự động xử lý class imbalance bằng `class_weight` khi phát hiện dataset lệch
-- Transfer learning 2 giai đoạn: feature extraction → fine-tuning với learning rate nhỏ
-- Callbacks: EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-
-**Đánh giá & báo cáo**
-
-- Accuracy, Precision, Recall, F1 (macro & weighted), Classification Report per-class
-- Confusion matrix heatmap + tự động tìm các cặp class hay bị nhầm
-- Error analysis: hiển thị ảnh dự đoán đúng/sai kèm confidence
-- Biểu đồ Training vs Validation (Accuracy & Loss) + phân tích overfitting/underfitting tự động
-- Báo cáo Markdown tổng hợp (`reports/evaluation_report.md`) sinh tự động
-
-**Demo application**
-
-- 3 tab: Dự đoán · Thông tin Model · Kết quả đánh giá
-- Upload + preview ảnh, dự đoán kèm confidence và Top-K, lịch sử dự đoán trong phiên
-- Chuyển đổi giữa 2 model để so sánh trực tiếp
-- Xử lý lỗi đầy đủ: ảnh hỏng, sai định dạng, chưa có model, chưa có kết quả đánh giá
-
-Hướng dẫn **chi tiết từng bước kèm giải thích** (kể cả khi bạn chưa quen deep learning) nằm trong [`TRAINING_GUIDE.md`](TRAINING_GUIDE.md) — bắt đầu từ đó nếu đây là lần đầu bạn train model này.
-
-## Quyết định kỹ thuật
-
-| Quyết định | Lựa chọn | Lý do |
-|---|---|---|
-| Framework | TensorFlow/Keras | API cao cấp (Keras), tài liệu tiếng Việt/Anh phong phú, tích hợp sẵn `MobileNetV2` pretrained, phù hợp trình độ sinh viên. |
-| Model 1 | CNN tự xây (baseline) | Bắt buộc theo yêu cầu môn học — có kết quả tham chiếu, thể hiện hiểu biết kiến trúc CNN cơ bản. |
-| Model 2 | MobileNetV2 (transfer learning) | Dataset nhỏ (~100 ảnh/lớp) — train CNN sâu từ đầu dễ overfitting nặng. MobileNetV2 nhẹ, đã học đặc trưng thị giác tổng quát từ ImageNet, fine-tune hiệu quả với ít dữ liệu. |
-| Demo UI | Streamlit | Đơn giản, 1 file, không cần frontend/backend tách riêng — đúng theo mức độ phức tạp phù hợp với đồ án môn học (tránh over-engineering). |
-| Input size | 224×224 | Kích thước input mặc định của MobileNetV2 — dùng chung cho cả 2 model để pipeline preprocessing thống nhất. |
-
-## Testing
+## EDA — Phân tích dữ liệu
 
 ```bash
-pytest tests/ -v
+python -m src.data.eda --data-dir data/raw --split train
 ```
 
-Test suite dùng dataset giả lập (sinh tự động trong lúc test) nên chạy được **mà không cần** dataset thật hay GPU — dùng để kiểm tra logic pipeline (data loading, augmentation, model build, training, inference, xử lý lỗi ảnh không hợp lệ...) luôn đúng.
+Hoặc mở notebook tương tác:
 
-## Kết quả model (điền sau khi train trên dataset thật)
+```bash
+jupyter notebook notebooks/EDA.ipynb
+```
 
-Bảng so sánh model đầy đủ được tự động sinh ra tại `reports/model_comparison.csv` sau khi chạy `python -m src.evaluation.evaluate --compare`. Xem `reports/*_summary.json` để biết class dễ nhầm lẫn, dấu hiệu overfitting/underfitting, và các phân tích khác.
+Kết quả lưu vào `reports/figures/`: biểu đồ phân bố class, ảnh mẫu, phân bố kích thước ảnh, HOG visualization.
 
-| Model | Test Accuracy | Precision (macro) | Recall (macro) | F1-score (macro) | Training Time |
-|---|---:|---:|---:|---:|---:|
-| CNN Baseline | _(điền sau khi train)_ | | | | |
-| MobileNetV2 Transfer | _(điền sau khi train)_ | | | | |
+---
 
-## Giấy phép & nguồn dữ liệu
+## Huấn luyện model
 
-Dataset thuộc về tác giả gốc trên Kaggle (kritikseth). Project này phục vụ mục đích học tập trong học phần Học máy.
+Tất cả hyperparameter quan trọng được quản lý tập trung trong [`configs/config.py`](configs/config.py):
+
+| Tham số | CNN/MobileNetV2 | SVM |
+|---------|----------------|-----|
+| Input size | `IMG_SIZE = (128, 128)` | `IMG_SIZE = (128, 128)` |
+| Batch size | `BATCH_SIZE = 32` | N/A |
+| Epochs | `EPOCHS = 30` | N/A |
+| Learning rate | `LEARNING_RATE = 1e-3` | N/A |
+| C values | N/A | `SVM_C_LIST = [0.1, 1, 10, 100]` |
+| Gamma values | N/A | `SVM_GAMMA_LIST = ['scale', 'auto']` |
+| PCA components | N/A | `PCA_N_COMPONENTS = 200` |
+
+**Lưu ý**: CNN và MobileNetV2 cần GPU để train nhanh. SVM chạy được trên CPU (mất ~1–3 giờ với GridSearchCV 5-fold).
+
+---
+
+## Đánh giá & So sánh
+
+Metric đánh giá mỗi model:
+
+- **Accuracy** — % dự đoán đúng
+- **Precision / Recall / F1-score** — theo từng class và macro/weighted
+- **Confusion Matrix** — phát hiện class hay bị nhầm lẫn
+- **Classification Report** — chi tiết từng trong 36 class
+
+```bash
+# Đánh giá 1 model
+python -m src.evaluation.evaluate --checkpoint <path_to_checkpoint> --data-dir data/raw
+
+# So sánh tất cả model
+python -m src.evaluation.compare_models --checkpoints <ck1> <ck2> <ck3> --data-dir data/raw
+```
+
+Kết quả lưu tại `reports/model_comparison.md`.
+
+---
+
+## Inference
+
+```bash
+python -m src.inference.predict \
+    --image path/to/image.jpg \
+    --checkpoint checkpoints/baseline_cnn_best.keras
+```
+
+Output mẫu:
+
+```
+Prediction  : Carrot
+Confidence  : 96.42%
+
+Top-3 predictions:
+  1. Carrot        96.42%
+  2. Sweet potato   2.11%
+  3. Beetroot       0.83%
+```
+
+---
+
+## Demo Streamlit
+
+```bash
+streamlit run app/streamlit_app.py
+```
+
+Tính năng:
+- Upload ảnh từ máy tính
+- Chọn model: SVM / CNN / MobileNetV2
+- Xem predicted class + confidence score
+- Xem Top-K predictions
+- Xem thông tin model
+- Xử lý lỗi khi ảnh không hợp lệ
+
+---
+
+## Kết quả
+
+> ⏳ **Đang cập nhật** — SVM đang trong quá trình training. CNN và MobileNetV2 đã train xong.
+
+Bảng so sánh sẽ được cập nhật sau khi SVM training hoàn tất:
+
+| Model | Accuracy | Precision | Recall | F1-score | Thời gian train |
+|-------|:--------:|:---------:|:------:|:--------:|:--------------:|
+| HOG + PCA + SVM | — | — | — | — | — |
+| CNN Baseline | — | — | — | — | ~2h (GPU) |
+| MobileNetV2 | — | — | — | — | ~1h (GPU) |
+
+Các file kết quả hiện có trong `reports/`:
+- `reports/baseline_cnn_evaluation.json`
+- `reports/mobilenetv2_transfer_evaluation.json`
+- `reports/figures/` — confusion matrix, training curves
+
+---
+
+## Hạn chế & Hướng phát triển
+
+**Hạn chế hiện tại:**
+- SVM không scale tốt khi dataset lớn (HOG extraction tốn RAM)
+- CNN baseline có thể overfit do dataset nhỏ (~100 ảnh/class)
+- Chưa thử ResNet, EfficientNet để có thêm điểm so sánh
+
+**Hướng phát triển:**
+- Thêm architecture (EfficientNet, ResNet50) vào bảng so sánh
+- Data augmentation mạnh hơn để giảm overfitting
+- Triển khai REST API thay vì chỉ Streamlit
+- Fine-tune MobileNetV2 sâu hơn (unfreeze nhiều layer hơn)
+
+---
+
+## Phân công nhóm
+
+| Thành viên | Nhiệm vụ chính |
+|-----------|---------------|
+| TN 1 | `classical_svm.py` · `configs/config.py` · Báo cáo Word |
+| TN 2 | `hog_features.py` · `pca_wrapper.py` · EDA notebook |
+| TN 3 | Chạy SVM training · Bảng so sánh 3 model · PPT thuyết trình |
+| TN 4 | `streamlit_app.py` · Demo · Q&A kỹ thuật |
+
+---
+
+## Tài liệu thêm
+
+- [`TRAINING_GUIDE.md`](TRAINING_GUIDE.md) — hướng dẫn train trên máy local và Colab
+- [`ACADEMIC_PRESENTATION.md`](ACADEMIC_PRESENTATION.md) — câu hỏi & câu trả lời chuẩn bị cho buổi bảo vệ
