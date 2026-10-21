@@ -121,6 +121,28 @@ CONFIG = {
     },
 
     # -----------------------------------------------------------------
+    # Model — Classical SVM (HOG + Color Histogram → PCA → SVM)
+    # -----------------------------------------------------------------
+    "svm": {
+        "name": "classical_svm",
+        # Giá trị C để GridSearchCV thử — C điều chỉnh độ rộng margin:
+        #   C nhỏ (0.1) → margin rộng, chấp nhận phân loại sai nhiều hơn → ít overfit
+        #   C lớn (100) → margin hẹp, ôm sát dữ liệu → dễ overfit
+        "c_list": [0.1, 1, 10, 100],
+        # Gamma điều chỉnh ảnh hưởng của từng điểm dữ liệu trong kernel RBF:
+        #   'scale' → gamma = 1 / (n_features * X.var())  ← thường tốt hơn
+        #   'auto'  → gamma = 1 / n_features
+        "gamma_list": ["scale", "auto"],
+        # Số chiều PCA: giảm từ 8196 (HOG + màu) xuống 200
+        # Giữ lại ~95% phương sai, giúp SVM train nhanh hơn đáng kể
+        "pca_n_components": 200,
+        # Số fold cross-validation trong GridSearchCV (5 là tiêu chuẩn)
+        "cv_folds": 5,
+        # Kích thước ảnh đầu vào (phải khớp với hog_features.py)
+        "img_size": (128, 128),
+    },
+
+    # -----------------------------------------------------------------
     # Inference
     # -----------------------------------------------------------------
     "inference": {
