@@ -31,6 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from configs.config import CONFIG  # noqa: E402
 from src.inference.predict import VegetableClassifier, InvalidImageError  # noqa: E402
+from src.inference.svm_predict import SVMVegetableClassifier  # noqa: E402
 
 st.set_page_config(
     page_title="Phân loại Rau Củ Quả",
@@ -105,11 +106,34 @@ CUSTOM_CSS = """
 # ---------------------------------------------------------------------------
 # Thứ tự ưu tiên khi chọn model cho demo. Sau khi so sánh 2 model xong
 # (reports/model_comparison.csv), đặt FINAL MODEL bạn đã chọn lên đầu danh sách.
-CHECKPOINT_PRIORITY = ["mobilenetv2_transfer", "baseline_cnn"]
+CHECKPOINT_PRIORITY = ["mobilenetv2_transfer", "baseline_cnn", "svm"]
+
+# Tên model -> file checkpoint (SVM là .pkl và cần thêm pca_model.pkl)
+CHECKPOINT_FILES = {
+    "mobilenetv2_transfer": "mobilenetv2_transfer.keras",
+    "baseline_cnn": "baseline_cnn.keras",
+    "svm": "svm_model.pkl",
+}
+DISPLAY_NAMES = {
+    "mobilenetv2_transfer": "MobileNetV2 (Transfer Learning)",
+    "baseline_cnn": "CNN Baseline",
+    "svm": "HOG → PCA → SVM (ML cổ điển)",
+}
+
+# Ngưỡng (thấp, cao) để cảnh báo độ tin cậy. SVM dùng xác suất Platt scaling trên
+# 36 class nên xác suất thường thấp hơn softmax của CNN -> dùng ngưỡng thấp hơn.
+# Đây là giá trị tạm: chỉnh lại sau khi xem kết quả thật của SVM.
+CONF_THRESHOLDS = {"svm": (0.2, 0.4), "default": (0.4, 0.7)}
+
+
+def conf_thresholds(model_name: str) -> tuple[float, float]:
+    return CONF_THRESHOLDS.get(model_name, CONF_THRESHOLDS["default"])
 
 
 @st.cache_resource(show_spinner="Đang load model...")
-def get_classifier(checkpoint_path: str) -> VegetableClassifier:
+def get_classifier(checkpoint_path: str):
+    if str(checkpoint_path).endswith(".pkl"):
+        return SVMVegetableClassifier(checkpoint_path)
     return VegetableClassifier(checkpoint_path)
 
 
@@ -127,10 +151,49 @@ def find_available_checkpoints() -> list[tuple[str, Path]]:
     ckpt_dir = Path(CONFIG["paths"]["checkpoints_dir"])
     found = []
     for name in CHECKPOINT_PRIORITY:
-        path = ckpt_dir / f"{name}.keras"
-        if path.exists():
-            found.append((name, path))
+        path = ckpt_dir / CHECKPOINT_FILES[name]
+        if not path.exists():
+            continue
+        # SVM chỉ dùng được khi có đủ cả PCA đã fit
+        if name == "svm" and not (ckpt_dir / "pca_model.pkl").exists():
+            continue
+        found.append((name, path))
     return found
+
+
+def normalize_svm_summary(raw: dict) -> dict:
+    """Đưa svm_evaluation.json (TN 3) về cùng định dạng *_summary.json của CNN.
+
+    Chưa biết chính xác tên key TN 3 sẽ sinh ra, nên thử nhiều tên phổ biến.
+    Sau khi có file thật, chỉnh danh sách key bên dưới cho khớp.
+    """
+    def pick(*keys):
+        for k in keys:
+            if k in raw and raw[k] is not None:
+                return raw[k]
+        return None
+
+    summary = {
+        "test_accuracy": pick("test_accuracy", "accuracy"),
+        "test_precision_macro": pick("test_precision_macro", "precision_macro", "precision"),
+        "test_recall_macro": pick("test_recall_macro", "recall_macro", "recall"),
+        "test_f1_macro": pick("test_f1_macro", "f1_macro", "f1_score", "f1"),
+        "num_test_samples": pick("num_test_samples", "n_test"),
+        "num_misclassified": pick("num_misclassified"),
+        "best_class": pick("best_class"),
+        "worst_class": pick("worst_class"),
+        "top_confused_pairs": pick("top_confused_pairs"),
+        "overfitting_analysis": pick("overfitting_analysis"),
+        # Thông tin riêng của SVM trong svm_evaluation.json (classical_svm.py)
+        "svm_extra": {
+            "train_time_minutes": pick("train_time_minutes"),
+            "best_cv_f1": pick("best_cv_f1"),
+            "pca_variance_kept": pick("pca_variance_kept"),
+        },
+    }
+    if summary["test_accuracy"] is None:
+        return {}
+    return summary
 
 
 def render_topk_chart(top_k: list[dict]):
@@ -156,10 +219,11 @@ def render_topk_chart(top_k: list[dict]):
     st.markdown("".join(html), unsafe_allow_html=True)
 
 
-def confidence_color(confidence: float) -> str:
-    if confidence >= 0.7:
+def confidence_color(confidence: float, model_name: str = "default") -> str:
+    low, high = conf_thresholds(model_name)
+    if confidence >= high:
         return GOOD
-    if confidence >= 0.4:
+    if confidence >= low:
         return WARNING
     return CRITICAL
 
@@ -167,7 +231,7 @@ def confidence_color(confidence: float) -> str:
 # ---------------------------------------------------------------------------
 # Tab 1 — Dự đoán
 # ---------------------------------------------------------------------------
-def tab_predict(classifier: VegetableClassifier, top_k: int):
+def tab_predict(classifier, top_k: int, model_name: str = "default"):
     left, right = st.columns([1, 1], gap="large")
 
     with left:
@@ -222,7 +286,8 @@ def tab_predict(classifier: VegetableClassifier, top_k: int):
                 st.error(f"❌ Có lỗi xảy ra khi dự đoán: {e}")
                 return
 
-        color = confidence_color(result.confidence)
+        color = confidence_color(result.confidence, model_name)
+        low_thr, high_thr = conf_thresholds(model_name)
         st.markdown(
             f'<div class="result-card">'
             f'  <div class="result-label">Kết quả dự đoán</div>'
@@ -233,13 +298,13 @@ def tab_predict(classifier: VegetableClassifier, top_k: int):
             unsafe_allow_html=True,
         )
 
-        if result.confidence < 0.4:
+        if result.confidence < low_thr:
             st.warning(
                 "⚠️ **Độ tin cậy thấp.** Ảnh có thể không thuộc các loại rau/quả model đã "
                 "được học, hoặc chất lượng ảnh chưa tốt (mờ, thiếu sáng, có nhiều vật thể). "
                 "Kết quả này không đáng tin cậy."
             )
-        elif result.confidence < 0.7:
+        elif result.confidence < high_thr:
             st.info(
                 "ℹ️ Độ tin cậy ở mức trung bình — nên tham khảo thêm các kết quả Top-K bên dưới."
             )
@@ -250,6 +315,7 @@ def tab_predict(classifier: VegetableClassifier, top_k: int):
         # Lưu vào lịch sử phiên làm việc
         st.session_state.setdefault("history", [])
         st.session_state["history"].insert(0, {
+            "model": DISPLAY_NAMES.get(model_name, model_name),
             "class": result.predicted_class,
             "confidence": result.confidence,
         })
@@ -261,7 +327,12 @@ def tab_predict(classifier: VegetableClassifier, top_k: int):
         st.markdown("##### 🕘 Lịch sử dự đoán trong phiên này")
         st.dataframe(
             [
-                {"#": i + 1, "Loại rau/quả": h["class"], "Độ tin cậy": f"{h['confidence']:.2%}"}
+                {
+                    "#": i + 1,
+                    "Model": h.get("model", "—"),
+                    "Loại rau/quả": h["class"],
+                    "Độ tin cậy": f"{h['confidence']:.2%}",
+                }
                 for i, h in enumerate(history)
             ],
             hide_index=True,
@@ -281,9 +352,25 @@ def tab_model_info(classifier: VegetableClassifier, model_name: str):
     c1, c2, c3 = st.columns(3)
     c1.metric("Số class", info["num_classes"])
     c2.metric("Input size", f"{info['input_size']}×{info['input_size']}")
-    c3.metric("Số parameters", f"{info['num_parameters']:,}")
+    if info.get("kind") == "svm":
+        c3.metric("Support vectors", f"{info['num_support_vectors']:,}" if info.get("num_support_vectors") else "—")
+        st.markdown("##### Cấu hình pipeline HOG → PCA → SVM")
+        params = info.get("best_params") or {}
+        rows = [
+            ("Đặc trưng", "HOG + Color Histogram"),
+            ("Số chiều sau PCA", info.get("pca_components") or "—"),
+            ("Kernel", info.get("kernel") or "—"),
+            ("C tốt nhất (GridSearchCV)", params.get("C", "—")),
+            ("Gamma tốt nhất (GridSearchCV)", params.get("gamma", "—")),
+        ]
+        st.dataframe(
+            [{"Thông số": k, "Giá trị": str(v)} for k, v in rows],
+            hide_index=True, use_container_width=True,
+        )
+    else:
+        c3.metric("Số parameters", f"{info['num_parameters']:,}")
 
-    if meta:
+    if meta and info.get("kind") != "svm":
         st.markdown("##### Cấu hình huấn luyện")
         rows = [
             ("Architecture", meta.get("architecture", "—")),
@@ -306,7 +393,7 @@ def tab_model_info(classifier: VegetableClassifier, model_name: str):
             m1.metric("Train accuracy", f"{meta['final_train_accuracy']:.2%}")
         if isinstance(meta.get("final_val_accuracy"), (int, float)):
             m2.metric("Validation accuracy", f"{meta['final_val_accuracy']:.2%}")
-    else:
+    elif info.get("kind") != "svm":
         st.info(
             "Chưa tìm thấy file metadata của model này trong `reports/`. "
             "Train lại model để sinh đầy đủ thông tin huấn luyện."
@@ -325,21 +412,40 @@ def tab_model_info(classifier: VegetableClassifier, model_name: str):
 def tab_evaluation(model_name: str):
     st.subheader("Kết quả đánh giá trên tập test độc lập")
 
-    summary = load_report(model_name, "summary")
     figures_dir = Path(CONFIG["paths"]["figures_dir"])
 
-    if summary is None:
+    if model_name == "svm":
+        # SVM ghi kết quả vào reports/svm_evaluation.json (do TN 3 sinh ra)
+        path = Path(CONFIG["paths"]["reports_dir"]) / "svm_evaluation.json"
+        raw = None
+        if path.exists():
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        summary = normalize_svm_summary(raw) if raw else None
+    else:
+        summary = load_report(model_name, "summary")
+
+    if not summary:
         st.info(
             "Chưa có kết quả đánh giá cho model này.\n\n"
-            "Chạy lệnh sau để sinh đầy đủ metrics và biểu đồ:\n\n"
-            "```bash\npython -m src.evaluation.evaluate --compare\n```"
+            + (
+                "Kết quả SVM được lưu ở `reports/svm_evaluation.json` sau khi train xong "
+                "(`python -m src.models.classical_svm`)."
+                if model_name == "svm"
+                else "Chạy lệnh sau để sinh đầy đủ metrics và biểu đồ:\n\n"
+                "```bash\npython -m src.evaluation.evaluate --compare\n```"
+            )
         )
     else:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Test Accuracy", f"{summary['test_accuracy']:.2%}")
-        c2.metric("Precision (macro)", f"{summary['test_precision_macro']:.3f}")
-        c3.metric("Recall (macro)", f"{summary['test_recall_macro']:.3f}")
-        c4.metric("F1-score (macro)", f"{summary['test_f1_macro']:.3f}")
+        def _fmt(key):
+            v = summary.get(key)
+            return f"{v:.3f}" if isinstance(v, (int, float)) else "—"
+
+        c2.metric("Precision (macro)", _fmt("test_precision_macro"))
+        c3.metric("Recall (macro)", _fmt("test_recall_macro"))
+        c4.metric("F1-score (macro)", _fmt("test_f1_macro"))
 
         st.caption(
             f"Đánh giá trên {summary.get('num_test_samples', '—')} ảnh test · "
@@ -347,6 +453,17 @@ def tab_evaluation(model_name: str):
             f"Class tốt nhất: **{summary.get('best_class', '—')}** · "
             f"Class yếu nhất: **{summary.get('worst_class', '—')}**"
         )
+
+        extra = summary.get("svm_extra") or {}
+        parts = []
+        if isinstance(extra.get("train_time_minutes"), (int, float)):
+            parts.append(f"Thời gian train: **{extra['train_time_minutes']:.1f} phút**")
+        if isinstance(extra.get("best_cv_f1"), (int, float)):
+            parts.append(f"F1 cross-validation: **{extra['best_cv_f1']:.3f}**")
+        if isinstance(extra.get("pca_variance_kept"), (int, float)):
+            parts.append(f"Phương sai PCA giữ lại: **{extra['pca_variance_kept']:.1%}**")
+        if parts:
+            st.caption(" · ".join(parts))
 
         overfit = summary.get("overfitting_analysis")
         if overfit:
@@ -397,12 +514,72 @@ def tab_evaluation(model_name: str):
 
 
 # ---------------------------------------------------------------------------
+# Tab 4 — So sánh các model trên cùng 1 ảnh
+# ---------------------------------------------------------------------------
+def tab_compare(available: list[tuple[str, Path]], top_k: int):
+    st.subheader("So sánh các model trên cùng một ảnh")
+    st.caption("Upload 1 ảnh, mỗi model sẽ tự dự đoán — dùng để chụp màn hình cho báo cáo/PPT.")
+
+    uploaded = st.file_uploader(
+        "Upload ảnh rau/củ/quả",
+        type=["jpg", "jpeg", "png", "bmp", "webp"],
+        key="compare_uploader",
+    )
+    if uploaded is None:
+        st.markdown(
+            '<div class="empty-state">📁<br><br>Hãy upload một ảnh để so sánh các model.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    try:
+        image = Image.open(uploaded)
+        image.load()
+    except Exception:  # noqa: BLE001
+        st.error("❌ Không thể mở ảnh này. Hãy thử một ảnh khác.")
+        return
+
+    st.image(image, caption=uploaded.name, width=280)
+
+    cols = st.columns(len(available))
+    top1 = []
+    for col, (name, path) in zip(cols, available):
+        with col:
+            st.markdown(f"##### {DISPLAY_NAMES.get(name, name)}")
+            try:
+                result = get_classifier(str(path)).predict(image, top_k=top_k)
+            except InvalidImageError as e:
+                st.error(f"❌ Ảnh không hợp lệ: {e}")
+                continue
+            except Exception as e:  # noqa: BLE001
+                st.error(f"❌ Lỗi khi dự đoán: {e}")
+                continue
+            top1.append(result.predicted_class)
+            color = confidence_color(result.confidence, name)
+            st.markdown(
+                f'<div class="result-card">'
+                f'  <div class="result-class" style="font-size:1.5rem;">{result.predicted_class}</div>'
+                f'  <div class="result-confidence" style="color:{color};">'
+                f'    Độ tin cậy: {result.confidence:.2%}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            render_topk_chart(result.top_k)
+
+    if len(top1) > 1:
+        if len(set(top1)) == 1:
+            st.success(f"✅ Các model đều dự đoán: **{top1[0]}**")
+        else:
+            st.warning("⚠️ Các model cho kết quả khác nhau — đây là ca hay để phân tích trong báo cáo.")
+
+
+# ---------------------------------------------------------------------------
 def main():
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
     st.markdown(
         '<div class="app-header">'
         '<h1>🥕 Hệ thống Phân loại Rau Củ Quả</h1>'
-        '<p>Đồ án học phần Học máy — Nhận diện loại rau/củ/quả từ ảnh bằng Deep Learning</p>'
+        '<p>Đồ án học phần Học máy — Nhận diện rau/củ/quả từ ảnh: SVM, CNN và Transfer Learning</p>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -424,17 +601,18 @@ def main():
     with st.sidebar:
         st.markdown("### ⚙️ Cấu hình")
 
-        display_names = {
-            "mobilenetv2_transfer": "MobileNetV2 (Transfer Learning)",
-            "baseline_cnn": "CNN Baseline",
-        }
         options = [name for name, _ in available]
         selected = st.selectbox(
             "Model sử dụng",
             options,
-            format_func=lambda n: display_names.get(n, n),
-            help="Mặc định là final model đã chọn. Có thể đổi để so sánh trực tiếp 2 model.",
+            format_func=lambda n: DISPLAY_NAMES.get(n, n),
+            help="Chọn model để dự đoán. Tab *So sánh model* chạy tất cả model cùng lúc.",
         )
+        if not any(n == "svm" for n in options):
+            st.caption(
+                "ℹ️ Chưa thấy model SVM (cần `checkpoints/svm_model.pkl` và "
+                "`checkpoints/pca_model.pkl`)."
+            )
         checkpoint_path = dict(available)[selected]
 
         classifier = None
@@ -445,7 +623,7 @@ def main():
 
         if classifier is not None:
             max_k = min(10, classifier.model_info()["num_classes"])
-            top_k = st.slider("Số kết quả Top-K", 1, max_k, min(5, max_k))
+            top_k = st.slider("Số kết quả Top-K", 1, max_k, min(3, max_k))
         else:
             top_k = 5
 
@@ -458,13 +636,17 @@ def main():
     if classifier is None:
         st.stop()
 
-    tab1, tab2, tab3 = st.tabs(["🔍 Dự đoán", "🧠 Thông tin Model", "📊 Kết quả đánh giá"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["🔍 Dự đoán", "🧠 Thông tin Model", "📊 Kết quả đánh giá", "⚖️ So sánh model"]
+    )
     with tab1:
-        tab_predict(classifier, top_k)
+        tab_predict(classifier, top_k, selected)
     with tab2:
         tab_model_info(classifier, selected)
     with tab3:
         tab_evaluation(selected)
+    with tab4:
+        tab_compare(available, top_k)
 
 
 if __name__ == "__main__":
