@@ -117,7 +117,7 @@ CHECKPOINT_FILES = {
 DISPLAY_NAMES = {
     "mobilenetv2_transfer": "MobileNetV2 (Transfer Learning)",
     "baseline_cnn": "CNN Baseline",
-    "svm": "HOG → PCA → SVM (ML cổ điển)",
+    "svm": "CNN features → PCA → SVM (ML cổ điển)",
 }
 
 # Ngưỡng (thấp, cao) để cảnh báo độ tin cậy. SVM dùng xác suất Platt scaling trên
@@ -378,7 +378,7 @@ def tab_model_info(classifier: VegetableClassifier, model_name: str):
     c2.metric("Input size", f"{info['input_size']}×{info['input_size']}")
     if info.get("kind") == "svm":
         c3.metric("Support vectors", f"{info['num_support_vectors']:,}" if info.get("num_support_vectors") else "—")
-        st.markdown("##### Cấu hình pipeline HOG → PCA → SVM")
+        st.markdown("##### Cấu hình pipeline SVM (đặc trưng CNN)")
         params = info.get("best_params") or {}
         rows = [
             ("Đặc trưng", info.get("feature_desc", "HOG + Color Histogram")),
@@ -387,6 +387,8 @@ def tab_model_info(classifier: VegetableClassifier, model_name: str):
             ("C tốt nhất (GridSearchCV)", params.get("C", "—")),
             ("Gamma tốt nhất (GridSearchCV)", params.get("gamma", "—")),
         ]
+        if params.get("cnn_pca"):
+            rows.append(("Số chiều PCA (đặc trưng CNN)", params["cnn_pca"]))
         if params.get("flip_augment"):
             rows.append(("Tăng cường dữ liệu", "Lật ngang ảnh train"))
         if "color_w" in params:
