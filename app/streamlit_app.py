@@ -381,12 +381,14 @@ def tab_model_info(classifier: VegetableClassifier, model_name: str):
         st.markdown("##### Cấu hình pipeline HOG → PCA → SVM")
         params = info.get("best_params") or {}
         rows = [
-            ("Đặc trưng", "HOG + Color Histogram"),
+            ("Đặc trưng", info.get("feature_desc", "HOG + Color Histogram")),
             ("Số chiều sau PCA", info.get("pca_components") or "—"),
             ("Kernel", info.get("kernel") or "—"),
             ("C tốt nhất (GridSearchCV)", params.get("C", "—")),
             ("Gamma tốt nhất (GridSearchCV)", params.get("gamma", "—")),
         ]
+        if params.get("flip_augment"):
+            rows.append(("Tăng cường dữ liệu", "Lật ngang ảnh train"))
         if "color_w" in params:
             rows.append(("Trọng số màu (Hellinger)", params["color_w"]))
         if info.get("architecture"):

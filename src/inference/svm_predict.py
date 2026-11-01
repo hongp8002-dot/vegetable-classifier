@@ -6,7 +6,8 @@ trả về PredictionResult) nên Streamlit dùng được cả 3 model.
 Hỗ trợ 2 định dạng file model:
   1. BUNDLE do `python -m src.training.train_svm` lưu: checkpoints/classical_svm.pkl
      (dict gồm backend, pipeline hoặc pca+svm, class_names, feature_params...).
-     Đây là định dạng mặc định hiện tại của nhóm.
+     Đây là định dạng mặc định hiện tại của nhóm. backend "v2" dùng bộ đặc trưng
+     src/features/svm_features.py (HOG16 + HSV + HSV theo vùng + LBP).
   2. CẶP FILE do classical_svm.py / train_svm --backend tn1 lưu:
      checkpoints/svm_model.pkl + checkpoints/pca_model.pkl.
 
@@ -92,8 +93,11 @@ def _load_pca(path: Path):
     return joblib.load(path)
 
 
-def _current_feature_params() -> dict:
-    """Tham số đặc trưng hiện tại của hog_features.py (cùng cách train_svm.py ghi lại)."""
+def _current_feature_params(saved: dict | None = None) -> dict:
+    """Tham số đặc trưng hiện tại của code (cùng cách train_svm.py ghi lại)."""
+    if saved and saved.get("feature_set") == "v2":
+        from src.features.svm_features import feature_params
+        return json.loads(json.dumps(feature_params(saved.get("blocks"))))
     from src.features import hog_features as hf
 
     params = {
@@ -108,7 +112,7 @@ def _current_feature_params() -> dict:
 
 
 def _check_feature_params(saved: dict) -> None:
-    current = _current_feature_params()
+    current = _current_feature_params(saved)
     saved = json.loads(json.dumps(saved))
     diffs = {k: (saved[k], current[k]) for k in saved if k in current and saved[k] != current[k]}
     if diffs:
@@ -153,7 +157,13 @@ class SVMVegetableClassifier:
             fp = obj.get("feature_params") or {}
             default_size = config.get("svm", {}).get("img_size", (128, 128))
             self.img_size = tuple(fp.get("img_size", default_size))
-            if obj["backend"] == "sklearn":
+            if obj["backend"] == "v2":
+                from src.features.svm_features import extract_vector
+
+                blocks = obj["blocks"]
+                self._extract = lambda image: extract_vector(image, blocks)
+                self._estimator = obj["pipeline"]
+            elif obj["backend"] == "sklearn":
                 self._estimator = obj["pipeline"]
             else:
                 self._estimator = obj["svm"].model
@@ -268,7 +278,12 @@ class SVMVegetableClassifier:
         pca_components, best_params = None, None
         if self.bundle is not None:
             n_support = self.bundle.get("n_support_vectors") or n_support
-            if self.bundle["backend"] == "sklearn":
+            if self.bundle["backend"] == "v2":
+                hog_block = next(b for b in self.bundle["blocks"] if b.startswith("hog"))
+                pca_components = self.bundle["pipeline"].named_steps["features"] \
+                    .named_transformers_[hog_block].named_steps["pca"].n_components_
+                best_params = self.bundle.get("best_params") or meta.get("best_params")
+            elif self.bundle["backend"] == "sklearn":
                 try:
                     pca_components = self.bundle["pipeline"].named_steps["features"] \
                         .named_transformers_["hog"].n_components_
@@ -293,5 +308,8 @@ class SVMVegetableClassifier:
             "pca_components": pca_components,
             "best_params": best_params,
             "kernel": getattr(svc, "kernel", None),
+            "feature_desc": ("HOG (cell 16) + Histogram HSV + HSV theo vùng + LBP"
+                             if self.bundle is not None and self.bundle["backend"] == "v2"
+                             else "HOG + Color Histogram"),
             "architecture": meta.get("architecture"),
         }
