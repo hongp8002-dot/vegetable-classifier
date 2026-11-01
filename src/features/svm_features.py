@@ -12,6 +12,10 @@ So với bộ v1 (hog_features.py: HOG cell 8 + histogram RGB):
 Mọi khối nhận cùng một ảnh RGB uint8 đã resize về CONFIG["svm"]["img_size"] (128x128) bằng
 hog_features.load_and_resize, nên huấn luyện và dự đoán dùng đúng một cách tiền xử lý.
 
+Khối "cnn" (hướng B): vector 1.280 chiều lấy từ lớp Global Average Pooling của MobileNetV2 đã
+huấn luyện sẵn trên ImageNet (KHÔNG huấn luyện lại – chỉ dùng làm bộ trích đặc trưng), ảnh vào
+224x224. Mô hình phân loại vẫn là PCA + SVM. Khối này cần TensorFlow và được tính theo lô.
+
 Pipeline mô hình (build_pipeline):
     HOG   -> PCA(50) -> chuẩn hóa L2  ┐
     HSV   -> Hellinger -> chuẩn hóa L2 ├-> ghép -> SVC RBF
@@ -22,6 +26,8 @@ Chuẩn hóa L2 theo từng khối giúp các khối có vai trò ngang nhau mà
 """
 
 from __future__ import annotations
+
+import os
 
 import cv2
 import numpy as np
@@ -36,6 +42,12 @@ HOG_ORIENTATIONS = 9
 HSV_BINS = (32, 16, 16)          # H, S, V cho histogram toàn ảnh
 HSV_GRID_BINS = (16, 8, 8)       # H, S, V cho mỗi vùng
 LBP_SETTINGS = ((8, 1), (16, 2))  # (số điểm lân cận P, bán kính R), dạng "uniform"
+CNN_INPUT = 224                  # kích thước ảnh vào MobileNetV2
+CNN_DIM = 1280                   # số chiều đầu ra Global Average Pooling của MobileNetV2
+# Trọng số ImageNet (tự tải về ~/.keras/models lần đầu). Đặt biến môi trường SVM_CNN_WEIGHTS=none
+# để dùng mạng chưa huấn luyện – CHỈ dùng khi kiểm thử phần mềm, không dùng để báo cáo kết quả.
+CNN_WEIGHTS = None if os.environ.get("SVM_CNN_WEIGHTS", "imagenet").lower() == "none" else "imagenet"
+HANDCRAFTED = ("hog8", "hog16", "rgb", "hsv", "hsv_grid", "lbp")
 
 
 # ---------------------------------------------------------------------------
@@ -92,20 +104,40 @@ def extract_blocks(rgb: np.ndarray) -> dict[str, np.ndarray]:
 
 
 def extract_vector(rgb: np.ndarray, blocks: list[str] | None = None) -> np.ndarray:
-    """Ghép các khối theo đúng thứ tự `blocks` thành 1 vector (dùng khi dự đoán 1 ảnh)."""
+    """Ảnh RGB đã resize về IMG_SIZE -> vector các khối THỦ CÔNG theo thứ tự `blocks`."""
+    blocks = blocks or DEFAULT_BLOCKS
+    if "cnn" in blocks:
+        raise ValueError("Khối 'cnn' cần ảnh 224x224 – dùng extract_vector_from_image().")
     feats = extract_blocks(rgb)
-    return np.concatenate([feats[b] for b in (blocks or DEFAULT_BLOCKS)])
+    return np.concatenate([feats[b] for b in blocks])
+
+
+def extract_vector_from_image(rgb_full: np.ndarray, blocks: list[str] | None = None) -> np.ndarray:
+    """Ảnh RGB uint8 kích thước bất kỳ -> vector đầy đủ (kể cả khối 'cnn'), dùng khi dự đoán 1 ảnh.
+    Resize giống hệt lúc huấn luyện: 128x128 cho khối thủ công, 224x224 cho khối cnn (INTER_AREA)."""
+    blocks = blocks or DEFAULT_BLOCKS
+    parts = {}
+    hand = [b for b in blocks if b != "cnn"]
+    if hand:
+        small = cv2.resize(rgb_full, IMG_SIZE, interpolation=cv2.INTER_AREA)
+        feats = extract_blocks(small)
+        parts.update({b: feats[b] for b in hand})
+    if "cnn" in blocks:
+        big = cv2.resize(rgb_full, (CNN_INPUT, CNN_INPUT), interpolation=cv2.INTER_AREA)
+        parts["cnn"] = extract_cnn_batch(big[None])[0]
+    return np.concatenate([parts[b] for b in blocks])
 
 
 def block_dims(blocks: list[str] | None = None) -> dict[str, int]:
+    blocks = blocks or DEFAULT_BLOCKS
     dummy = np.zeros((*IMG_SIZE[::-1], 3), dtype=np.uint8)
     feats = extract_blocks(dummy)
-    return {b: int(feats[b].shape[0]) for b in (blocks or DEFAULT_BLOCKS)}
+    return {b: (CNN_DIM if b == "cnn" else int(feats[b].shape[0])) for b in blocks}
 
 
 def feature_params(blocks: list[str] | None = None) -> dict:
     """Tham số đặc trưng lưu kèm mô hình; svm_predict so sánh để tránh lệch train/dự đoán."""
-    return {
+    params = {
         "feature_set": "v2",
         "img_size": list(IMG_SIZE),
         "blocks": list(blocks or DEFAULT_BLOCKS),
@@ -114,6 +146,59 @@ def feature_params(blocks: list[str] | None = None) -> dict:
         "hsv_grid_bins": list(HSV_GRID_BINS),
         "lbp_settings": [list(s) for s in LBP_SETTINGS],
     }
+    if "cnn" in params["blocks"]:
+        params["cnn_backbone"] = f"MobileNetV2-{CNN_WEIGHTS}-avgpool"
+        params["cnn_input"] = CNN_INPUT
+    return params
+
+
+# ---------------------------------------------------------------------------
+# Khối "cnn": MobileNetV2 đã huấn luyện sẵn làm bộ trích đặc trưng (không fine-tune)
+# ---------------------------------------------------------------------------
+_CNN_MODEL = None
+
+
+def _cnn_model():
+    global _CNN_MODEL
+    if _CNN_MODEL is None:
+        import tensorflow as tf
+        _CNN_MODEL = tf.keras.applications.MobileNetV2(
+            include_top=False, pooling="avg", weights=CNN_WEIGHTS, input_shape=(CNN_INPUT, CNN_INPUT, 3))
+        _CNN_MODEL.trainable = False
+    return _CNN_MODEL
+
+
+def extract_cnn_batch(images: np.ndarray, batch_size: int = 32) -> np.ndarray:
+    """images: mảng uint8 (N, 224, 224, 3) RGB -> đặc trưng (N, 1280).
+    Chuẩn hóa đúng chuẩn đầu vào MobileNetV2: giá trị điểm ảnh về [-1, 1]."""
+    x = images.astype(np.float32) / 127.5 - 1.0
+    return _cnn_model().predict(x, batch_size=batch_size, verbose=0).astype(np.float32)
+
+
+def _load_rgb(path: str, size: tuple):
+    from src.features.hog_features import load_and_resize
+    try:
+        return load_and_resize(path, size)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cnn_for_paths(paths: list[str], with_flip: bool, n_jobs: int, chunk: int = 256):
+    from joblib import Parallel, delayed
+    feats, feats_flip, keep = [], [], []
+    for i in range(0, len(paths), chunk):
+        imgs = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_load_rgb)(p, (CNN_INPUT, CNN_INPUT)) for p in paths[i:i + chunk])
+        keep += [im is not None for im in imgs]
+        ok = np.stack([im for im in imgs if im is not None]) if any(im is not None for im in imgs) else None
+        if ok is None:
+            continue
+        feats.append(extract_cnn_batch(ok))
+        if with_flip:
+            feats_flip.append(extract_cnn_batch(np.ascontiguousarray(ok[:, :, ::-1])))
+    X = np.concatenate(feats) if feats else np.zeros((0, CNN_DIM), np.float32)
+    Xf = np.concatenate(feats_flip) if with_flip and feats_flip else None
+    return X, Xf, np.array(keep, dtype=bool)
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +221,35 @@ def batch_extract(paths: list[str], blocks: list[str] | None = None, with_flip: 
     from joblib import Parallel, delayed
 
     blocks = blocks or DEFAULT_BLOCKS
-    res = Parallel(n_jobs=n_jobs)(delayed(_extract_path)(p, blocks, with_flip) for p in paths)
-    keep = np.array([r is not None for r in res], dtype=bool)
-    ok = [r for r in res if r is not None]
-    if not ok:
+    hand = [b for b in blocks if b != "cnn"]
+    if hand and blocks[blocks.index(hand[0]): blocks.index(hand[0]) + len(hand)] != hand:
+        raise ValueError("Các khối thủ công phải đứng liền nhau trong danh sách blocks (vd ['cnn', 'hsv', 'lbp']).")
+
+    keep = np.ones(len(paths), dtype=bool)
+    hand_res, cnn_res = {}, {}
+    if hand:
+        res = Parallel(n_jobs=n_jobs)(delayed(_extract_path)(p, hand, with_flip) for p in paths)
+        keep &= np.array([r is not None for r in res], dtype=bool)
+        hand_res = {i: r for i, r in enumerate(res) if r is not None}
+    if "cnn" in blocks:
+        Xc, Xcf, keep_c = _cnn_for_paths(paths, with_flip, n_jobs)
+        cnn_res = {i: (Xc[j], Xcf[j] if with_flip else None) for j, i in enumerate(np.flatnonzero(keep_c))}
+        keep &= keep_c
+    idx = np.flatnonzero(keep)
+    if len(idx) == 0:
         raise ValueError("Không trích được đặc trưng từ ảnh nào.")
-    X = np.stack([r[0] for r in ok]).astype(np.float32)
-    X_flip = np.stack([r[1] for r in ok]).astype(np.float32) if with_flip else None
+
+    def _assemble(i: int, k: int) -> np.ndarray:   # k = 0: ảnh gốc, k = 1: ảnh lật
+        out = []
+        for b in blocks:
+            if b == "cnn":
+                out.append(cnn_res[i][k])
+            elif b == hand[0]:            # cả nhóm khối thủ công (liền nhau) đã được ghép sẵn
+                out.append(hand_res[i][k])
+        return np.concatenate(out)
+
+    X = np.stack([_assemble(i, 0) for i in idx]).astype(np.float32)
+    X_flip = np.stack([_assemble(i, 1) for i in idx]).astype(np.float32) if with_flip else None
     return X, X_flip, keep
 
 
@@ -155,7 +262,8 @@ def hellinger(x):
     return np.sqrt(np.clip(x, 0, None))
 
 
-def build_pipeline(blocks: list[str], dims: dict[str, int], hog_pca: int = 50, seed: int = 42):
+def build_pipeline(blocks: list[str], dims: dict[str, int], hog_pca: int = 50, seed: int = 42,
+                   cnn_pca: int = 256):
     from sklearn.compose import ColumnTransformer
     from sklearn.decomposition import PCA
     from sklearn.pipeline import Pipeline
@@ -168,6 +276,9 @@ def build_pipeline(blocks: list[str], dims: dict[str, int], hog_pca: int = 50, s
         start += dims[b]
         if b.startswith("hog"):
             step = Pipeline([("pca", PCA(hog_pca, random_state=seed)), ("l2", Normalizer())])
+        elif b == "cnn":   # căn bậc hai (power normalization) -> L2 -> PCA -> L2
+            step = Pipeline([("sqrt", FunctionTransformer(hellinger)), ("l2", Normalizer()),
+                             ("pca", PCA(cnn_pca, random_state=seed)), ("l2b", Normalizer())])
         else:
             step = Pipeline([("hellinger", FunctionTransformer(hellinger)), ("l2", Normalizer())])
         parts.append((b, step, cols))
@@ -175,6 +286,24 @@ def build_pipeline(blocks: list[str], dims: dict[str, int], hog_pca: int = 50, s
                      ("svc", SVC(kernel="rbf", gamma="scale", random_state=seed))])
 
 
-def model_dims(blocks: list[str], dims: dict[str, int], hog_pca: int) -> int:
-    """Số chiều thực sự đưa vào SVC (HOG sau PCA + các histogram)."""
-    return sum(hog_pca if b.startswith("hog") else dims[b] for b in blocks)
+BLOCK_NAMES = {"hog8": "HOG (cell 8)", "hog16": "HOG (cell 16)", "rgb": "Histogram RGB", "hsv": "Histogram HSV",
+               "hsv_grid": "HSV theo vùng", "lbp": "LBP", "cnn": "Đặc trưng MobileNetV2 (ImageNet)"}
+
+
+def describe_blocks(blocks: list[str], best_params: dict | None = None) -> str:
+    """Mô tả ngắn gọn bộ đặc trưng, dùng cho metadata và giao diện."""
+    bp = best_params or {}
+    out = []
+    for b in blocks:
+        name = BLOCK_NAMES.get(b, b)
+        if b.startswith("hog") and bp.get("hog_pca"):
+            name += f" -> PCA({bp['hog_pca']})"
+        if b == "cnn" and bp.get("cnn_pca"):
+            name += f" -> PCA({bp['cnn_pca']})"
+        out.append(name)
+    return " + ".join(out)
+
+
+def model_dims(blocks: list[str], dims: dict[str, int], hog_pca: int, cnn_pca: int = 256) -> int:
+    """Số chiều thực sự đưa vào SVC (HOG, CNN sau PCA + các histogram)."""
+    return sum(hog_pca if b.startswith("hog") else cnn_pca if b == "cnn" else dims[b] for b in blocks)

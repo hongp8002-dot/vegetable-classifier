@@ -149,6 +149,8 @@ CONFIG = {
         "v2_hog_pca": 50,
         "v2_c_list": [1, 3, 10, 30],
         "v2_flip_augment": True,
+        # Số chiều PCA thử cho khối "cnn" (đặc trưng MobileNetV2 1.280 chiều) – hướng B
+        "v2_cnn_pca": [128, 256],
     },
 
     # -----------------------------------------------------------------

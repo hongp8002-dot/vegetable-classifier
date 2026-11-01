@@ -15,6 +15,9 @@ là ĐẶC TRƯNG. Script này thử lần lượt các cải tiến đặc trư
     E4  thay HOG cell 8 bằng HOG thô cell 16           (ít chiều nhiễu hơn)
     E5  + lật ngang ảnh train (nhân đôi dữ liệu)
     E6  + class_weight='balanced', mở rộng lưới C
+    --- Hướng B (cần TensorFlow; bỏ qua bằng --no-cnn) ---
+    E7  Đặc trưng MobileNetV2 đã huấn luyện sẵn (KHÔNG fine-tune) -> PCA -> SVM
+    E8  Đặc trưng MobileNetV2 + toàn bộ đặc trưng thủ công của E5
 
 Quy trình đúng (không rò rỉ):
     - Siêu tham số (C, class_weight) chọn bằng GridSearchCV 5-fold CHỈ trên tập train.
@@ -29,7 +32,8 @@ Cách biểu diễn: mọi histogram dùng biến đổi Hellinger (căn bậc h
 (thay cho StandardScaler – vốn làm mất thông tin màu, xem reports/svm_tuning_log.csv).
 
 Chạy (sau khi đã có dataset sạch ở data/raw):
-    python scripts/svm_experiments.py
+    python scripts/svm_experiments.py            # E0-E8
+    python scripts/svm_experiments.py --no-cnn   # chỉ E0-E6 (không cần TensorFlow)
 Kết quả:
     reports/svm_feature_experiments.csv
 """
@@ -98,6 +102,10 @@ EXPERIMENTS = [
     ("E5", "+ lật ngang ảnh train", ["hog16", "hsv", "hsv_grid", "lbp"], True, {"svc__C": [1, 3, 10, 30]}),
     ("E6", "+ class_weight, lưới C rộng", ["hog16", "hsv", "hsv_grid", "lbp"], True,
      {"svc__C": [0.3, 1, 3, 10, 30], "svc__class_weight": [None, "balanced"]}),
+    ("E7", "Đặc trưng MobileNetV2 -> PCA (hướng B)", ["cnn"], True,
+     {"svc__C": [1, 3, 10, 30], "features__cnn__pca__n_components": [128, 256]}),
+    ("E8", "MobileNetV2 + đặc trưng thủ công E5", ["cnn", "hog16", "hsv", "hsv_grid", "lbp"], True,
+     {"svc__C": [1, 3, 10, 30], "features__cnn__pca__n_components": [128, 256]}),
 ]
 
 
@@ -115,17 +123,34 @@ def main():
     print(f"Classes: {len(class_names)} | train {len(tr_p)} | val {len(va_p)} | test {len(te_p)}")
 
     t0 = time.time()
-    tr, tr_flip, k = extract_split(tr_p)
-    y_tr = y_tr[k]
-    va, _, k = extract_split(va_p)
-    y_va = y_va[k]
-    te, _, k = extract_split(te_p)
-    y_te = y_te[k]
+    tr, tr_flip, k_tr = extract_split(tr_p)
+    y_tr = y_tr[k_tr]
+    va, _, k_va = extract_split(va_p)
+    y_va = y_va[k_va]
+    te, _, k_te = extract_split(te_p)
+    y_te = y_te[k_te]
+    experiments = EXPERIMENTS
+    if "--no-cnn" in sys.argv:
+        experiments = [e for e in EXPERIMENTS if "cnn" not in e[2]]
+    else:
+        try:
+            print("Trích đặc trưng MobileNetV2 (ảnh 224x224, kèm ảnh lật cho train)...")
+            for feats, flip_feats, paths, keep in ((tr, tr_flip, tr_p, k_tr), (va, None, va_p, k_va),
+                                                   (te, None, te_p, k_te)):
+                Xc, Xcf, kc = sf._cnn_for_paths([p for p, k in zip(paths, keep) if k], flip_feats is not None, -1)
+                if not kc.all():
+                    raise RuntimeError("Có ảnh đọc được cho đặc trưng thủ công nhưng lỗi khi đọc cho CNN")
+                feats["cnn"] = Xc
+                if flip_feats is not None:
+                    flip_feats["cnn"] = Xcf
+        except Exception as e:  # noqa: BLE001 – thiếu TensorFlow / không tải được trọng số ImageNet
+            print(f"[!] Bỏ qua E7, E8 (hướng B): {e}")
+            experiments = [e for e in EXPERIMENTS if "cnn" not in e[2]]
     dims = {b: v.shape[1] for b, v in tr.items()}
     print(f"Trích đặc trưng xong trong {time.time() - t0:.0f}s | số chiều mỗi khối: {dims}\n")
 
     rows, models = [], {}
-    for code, desc, blocks, use_flip, grid in EXPERIMENTS:
+    for code, desc, blocks, use_flip, grid in experiments:
         X = stack(tr, blocks)
         y, groups = y_tr, np.arange(len(y_tr))
         if use_flip:   # ảnh lật nằm cùng fold với ảnh gốc -> không rò rỉ trong CV
@@ -142,8 +167,10 @@ def main():
         p_tr, p_va = model.predict(Xtr), model.predict(Xva)
         row = {
             "code": code, "mo_ta": desc,
-            "so_chieu": sum(dims[b] if not b.startswith("hog") else HOG_PCA for b in blocks),
-            "best_params": {k.replace("svc__", ""): v for k, v in gs.best_params_.items()},
+            "so_chieu": sf.model_dims(blocks, dims, HOG_PCA,
+                                      gs.best_params_.get("features__cnn__pca__n_components", 0)),
+            "best_params": {k.replace("svc__", "").replace("features__cnn__pca__n_components", "cnn_pca"): v
+                            for k, v in gs.best_params_.items()},
             "cv_f1": round(gs.best_score_, 4),
             "train_acc": round(accuracy_score(y_tr, p_tr), 4),
             "val_acc": round(accuracy_score(y_va, p_va), 4),

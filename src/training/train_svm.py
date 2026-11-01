@@ -25,7 +25,11 @@ Cách chạy (từ thư mục gốc project):
     # 3) Train đầy đủ 36 class (mặc định: bộ đặc trưng v2 – src/features/svm_features.py)
     python -m src.training.train_svm
 
-    # 4) So sánh với các cấu hình cũ
+    # 4) Hướng B: SVM trên đặc trưng MobileNetV2 đã huấn luyện sẵn (cần TensorFlow)
+    python -m src.training.train_svm --blocks cnn --tag cnn
+    python -m src.training.train_svm --blocks cnn hog16 hsv hsv_grid lbp --tag cnn_v2
+
+    # 5) So sánh với các cấu hình cũ
     python -m src.training.train_svm --backend sklearn --tag v1   # HOG8-PCA + RGB Hellinger (TN 3)
     python -m src.training.train_svm --backend tn1 --tag tn1      # code TN 1 + TN 2 gốc
 
@@ -321,14 +325,18 @@ def train_v2(X, y, args, X_flip=None):
     blocks = args.v2_blocks
     dims = sf.block_dims(blocks)
     pipe = sf.build_pipeline(blocks, dims, hog_pca=args.v2_hog_pca, seed=args.seed)
+    has_hog = any(b.startswith("hog") for b in blocks)
 
     groups = np.arange(len(y))
     if X_flip is not None:
         X, y, groups = np.vstack([X, X_flip]), np.concatenate([y, y]), np.concatenate([groups, groups])
     folds = _cv_folds(y[: len(groups) // (2 if X_flip is not None else 1)], args.cv)
     grid = {"svc__C": args.c}
-    print(f"  GridSearchCV v2: khối {blocks} | HOG-PCA {args.v2_hog_pca} | C {args.c} | "
-          f"{'có' if X_flip is not None else 'không'} lật ảnh -> {len(args.c)} tổ hợp x {folds} fold")
+    if "cnn" in blocks:
+        grid["features__cnn__pca__n_components"] = args.v2_cnn_pca
+    n_comb = int(np.prod([len(v) for v in grid.values()]))
+    print(f"  GridSearchCV v2: khối {blocks} | lưới {grid} | "
+          f"{'có' if X_flip is not None else 'không'} lật ảnh -> {n_comb} tổ hợp x {folds} fold")
 
     gs = GridSearchCV(pipe, grid, scoring="f1_macro", n_jobs=args.n_jobs, verbose=1,
                       cv=StratifiedGroupKFold(folds, shuffle=True, random_state=args.seed),
@@ -345,19 +353,23 @@ def train_v2(X, y, args, X_flip=None):
         best.fit(X, y)
     t_refit = time.time() - t1
 
-    hog_block = next(b for b in blocks if b.startswith("hog"))
-    hog_pca = best.named_steps["features"].named_transformers_[hog_block].named_steps["pca"]
-    best_params = {"C": gs.best_params_["svc__C"], "gamma": "scale", "hog_pca": args.v2_hog_pca,
-                   "flip_augment": X_flip is not None}
+    tf_named = best.named_steps["features"].named_transformers_
+    pca_block = next(b for b in blocks if b.startswith("hog") or b == "cnn")
+    main_pca = tf_named[pca_block].named_steps["pca"]
+    cnn_pca = gs.best_params_.get("features__cnn__pca__n_components")
+    best_params = {"C": gs.best_params_["svc__C"], "gamma": "scale",
+                   "hog_pca": args.v2_hog_pca if has_hog else None,
+                   "cnn_pca": cnn_pca, "flip_augment": X_flip is not None}
     bundle = {
         "backend": "v2",
         "pipeline": best,
         "blocks": blocks,
         "dims": dims,
         "best_params": best_params,
-        "explained_variance": float(hog_pca.explained_variance_ratio_.sum()),
+        "explained_variance": float(main_pca.explained_variance_ratio_.sum()),
+        "pca_block": pca_block,
         "n_support_vectors": _n_support(best.named_steps["svc"]),
-        "n_model_dims": sf.model_dims(blocks, dims, args.v2_hog_pca),
+        "n_model_dims": sf.model_dims(blocks, dims, args.v2_hog_pca, cnn_pca or 0),
     }
     cr = gs.cv_results_
     cv_results = pd.DataFrame({
@@ -365,7 +377,10 @@ def train_v2(X, y, args, X_flip=None):
         "mean_test_score": cr["mean_test_score"], "std_test_score": cr["std_test_score"],
         "mean_train_score": cr["mean_train_score"], "mean_fit_time": cr["mean_fit_time"],
         "rank_test_score": cr["rank_test_score"],
-    }).sort_values("rank_test_score")
+    })
+    if "cnn" in blocks:
+        cv_results["cnn_pca"] = [int(v) for v in cr["param_features__cnn__pca__n_components"]]
+    cv_results = cv_results.sort_values("rank_test_score")
     return bundle, best_params, float(gs.best_score_), cv_results, t_search, t_refit
 
 
@@ -395,9 +410,9 @@ def predict_image(bundle, image_path: str, top_k: int = 3) -> list[dict]:
         predict_image(bundle, "anh.jpg")  ->  [{"class": "carrot", "confidence": 0.91}, ...]
     """
     if bundle["backend"] == "v2":
-        from src.features.hog_features import load_and_resize
-        from src.features.svm_features import IMG_SIZE, extract_vector
-        x = extract_vector(load_and_resize(image_path, IMG_SIZE), bundle["blocks"]).reshape(1, -1)
+        from src.features.hog_features import _read_image_rgb
+        from src.features.svm_features import extract_vector_from_image
+        x = extract_vector_from_image(_read_image_rgb(image_path), bundle["blocks"]).reshape(1, -1)
     else:
         from src.features.hog_features import extract_combined_features
         x = extract_combined_features(image_path).reshape(1, -1)
@@ -450,7 +465,7 @@ def plot_gridsearch(cv_results: pd.DataFrame, save_path: Path):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import seaborn as sns
-    col = "color_w" if "color_w" in cv_results else "gamma"
+    col = next(c for c in ("color_w", "cnn_pca", "gamma") if c in cv_results)
     table = cv_results.assign(**{col: cv_results[col].astype(str)}).pivot_table(
         index="C", columns=col, values="mean_test_score", aggfunc="max")
     fig, ax = plt.subplots(figsize=(1.6 * len(table.columns) + 3, 0.8 * len(table) + 2.5))
@@ -513,6 +528,10 @@ def main():
     p.add_argument("--c", type=float, nargs="+", default=None,
                    help="Lưới C. Mặc định: CONFIG['svm']['v2_c_list'] cho v2, [3, 10, 30] cho backend khác")
     p.add_argument("--no-flip", action="store_true", help="v2: không lật ngang ảnh train")
+    p.add_argument("--blocks", nargs="+", default=None,
+                   choices=["cnn", "hog8", "hog16", "rgb", "hsv", "hsv_grid", "lbp"],
+                   help="v2: các khối đặc trưng (mặc định CONFIG['svm']['v2_blocks']). "
+                        "'cnn' = đặc trưng MobileNetV2 đã huấn luyện sẵn (hướng B)")
     p.add_argument("--gamma", nargs="+", default=["scale"])
     p.add_argument("--n-components", type=int, default=svm_cfg.get("pca_n_components", 200))
     p.add_argument("--cv", type=int, default=svm_cfg.get("cv_folds", 5))
@@ -526,8 +545,9 @@ def main():
     args.gamma = parse_gamma(args.gamma)
     if args.c is None:
         args.c = list(svm_cfg.get("v2_c_list", [1, 3, 10, 30])) if args.backend == "v2" else [3, 10, 30]
-    args.v2_blocks = list(svm_cfg.get("v2_blocks", ["hog16", "hsv", "hsv_grid", "lbp"]))
+    args.v2_blocks = list(args.blocks or svm_cfg.get("v2_blocks", ["hog16", "hsv", "hsv_grid", "lbp"]))
     args.v2_hog_pca = int(svm_cfg.get("v2_hog_pca", 50))
+    args.v2_cnn_pca = list(svm_cfg.get("v2_cnn_pca", [128, 256]))
     use_flip = args.backend == "v2" and svm_cfg.get("v2_flip_augment", True) and not args.no_flip
 
     name = MODEL_NAME + (f"_{args.tag}" if args.tag else "")
@@ -633,8 +653,8 @@ def main():
 
     fp = bundle["feature_params"]
     if args.backend == "v2":
-        architecture = (f"HOG(cell 16) -> PCA({args.v2_hog_pca}) + Hist HSV + Hist HSV theo vùng (4 góc + giữa) "
-                        f"+ LBP -> Hellinger + L2 theo khối -> SVC RBF"
+        from src.features.svm_features import describe_blocks
+        architecture = (f"{describe_blocks(args.v2_blocks, best_params)} -> L2 theo khối -> SVC RBF"
                         f"{' (lật ngang ảnh train)' if use_flip else ''}")
     metadata = {
         "model_name": name,
@@ -651,7 +671,8 @@ def main():
         "n_support_vectors": bundle["n_support_vectors"],
         "input_size": fp["img_size"][0],
         "n_features_before_pca": int(X_tr.shape[1]),
-        "pca_components": best_params.get("hog_pca", min(args.n_components, X_tr.shape[1])),
+        "pca_components": (best_params.get("cnn_pca") or best_params.get("hog_pca")
+                           or min(args.n_components, X_tr.shape[1])),
         "pca_explained_variance": bundle["explained_variance"],
         "optimizer": "GridSearchCV (scoring = f1_macro)",
         "loss_function": "hinge (SVM)",
@@ -689,7 +710,7 @@ def main():
     print("\n" + "=" * 60)
     print(f"[{name}] Test accuracy {metrics['accuracy']:.2%} | F1 macro {metrics['f1_macro']:.4f}")
     print(f"Train acc {train_acc:.2%} | Val acc {val_acc:.2%} -> {overfit['status']}")
-    print(f"Best: {best_params} | PCA (HOG) giữ {bundle['explained_variance']:.1%} phương sai")
+    print(f"Best: {best_params} | PCA ({bundle.get('pca_block', 'HOG')}) giữ {bundle['explained_variance']:.1%} phương sai")
     print(f"Đã lưu: reports/{name}_*.json, checkpoints/{name}.pkl")
     print("Tiếp theo: python -m src.evaluation.compare_all")
 
